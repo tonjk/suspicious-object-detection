@@ -1,0 +1,5 @@
+ultralytics==8.4.36
+opencv-python==4.13.0.92
+numpy==2.4.4
+torch==2.11.0
+boxmot==17.0.0

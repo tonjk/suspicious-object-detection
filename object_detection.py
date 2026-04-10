@@ -18,14 +18,20 @@ PERSON_CLASS = "person"
 BAG_CLASSES = {"suitcase", "backpack", "handbag", "bag", "box"}
 
 PERSON_CONF = 0.35
-BAG_CONF = 0.25
+BAG_CONF_NEW = 0.30        # threshold for bag detections near no existing track
+BAG_CONF_TRACKED = 0.15   # lower threshold for detections near already-tracked bags
 MATCH_MAX_DIST = 110.0
-TRACK_MAX_LOST = 20
+TRACK_MAX_LOST = 75        # ~3.0s at 25fps; helps UNATTENDED bags survive short occlusions
+ABANDONED_TRACK_MAX_LOST_MULT = 8  # abandoned bags survive 8× longer before deletion
 
 ATTACH_DIST = 180.0
 ABANDON_SECONDS = 3.0
+UNOWNED_ABANDON_SECONDS = 8.0  # bag with no detected owner → abandoned after this
 STABLE_PIXEL_DRIFT = 30.0
 MIN_HISTORY_FOR_STABLE = 10
+
+GHOST_TTL = 10.0        # seconds an abandoned ghost stays in the graveyard
+GHOST_MATCH_DIST = 80.0  # pixels — new track within this radius inherits ghost state
 
 SCENE_CUT_THRESHOLD = 42.0
 
@@ -45,6 +51,18 @@ class Track:
     owner_id: int | None = None
     last_near_owner_time: float | None = None
     is_abandoned: bool = False  # latched True once ABANDONED, reset only when owner returns
+    is_ghost_injected: bool = False  # True when this frame's position came from ghost
+
+
+@dataclass
+class AbandonedGhost:
+    """Snapshot of a deleted abandoned track — used to re-ID resurrected detections."""
+    last_bbox: tuple[int, int, int, int]
+    last_centroid: tuple[int, int]
+    first_seen: float
+    last_near_owner_time: float | None
+    owner_id: int | None
+    deleted_at: float
 
 
 def centroid_from_bbox(bbox: tuple[int, int, int, int]) -> tuple[int, int]:
@@ -90,6 +108,7 @@ def cross_class_nms(
 # heavily with an existing track of a *different* class, absorb it instead of
 # spawning a duplicate track.
 CROSS_CLASS_IOU_MERGE = 0.35
+CROSS_CLASS_CENTROID_MERGE = 55.0  # also suppress cross-class duplicates when centroids are very close
 
 
 def update_tracks(
@@ -111,7 +130,8 @@ def update_tracks(
         to_remove: list[int] = []
         for tid, tr in tracks.items():
             tr.lost_frames += 1
-            if tr.lost_frames > TRACK_MAX_LOST:
+            max_lost = TRACK_MAX_LOST * ABANDONED_TRACK_MAX_LOST_MULT if tr.is_abandoned else TRACK_MAX_LOST
+            if tr.lost_frames > max_lost:
                 to_remove.append(tid)
         for tid in to_remove:
             tracks.pop(tid, None)
@@ -162,23 +182,26 @@ def update_tracks(
         used_track_idx.add(t_idx)
         current_ids.add(tid)
 
-    # --- Pass 2: cross-class IoU matching ---
+    # --- Pass 2: cross-class IoU / centroid matching ---
     # If a detection was NOT matched in pass 1 but overlaps heavily with an
-    # existing track (regardless of label), absorb it into that track rather
-    # than creating a duplicate.
-    cross_pairs: list[tuple[float, int, int]] = []   # (-iou, d_idx, t_idx)
+    # existing track (regardless of label), or their centroids are very close,
+    # absorb it into that track rather than creating a duplicate.
+    cross_pairs: list[tuple[float, int, int]] = []   # (score, d_idx, t_idx)  lower = better
     for d_idx, (label, bbox) in enumerate(detections):
         if d_idx in used_det:
             continue
+        c = centroid_from_bbox(bbox)
         for t_idx, (tid, tr) in enumerate(track_items):
             if t_idx in used_track_idx:
                 continue
             overlap = iou(bbox, tr.bbox)
-            if overlap >= CROSS_CLASS_IOU_MERGE:
-                cross_pairs.append((-overlap, d_idx, t_idx))   # negative for descending sort
+            cdist = euclid(c, tr.centroid)
+            if overlap >= CROSS_CLASS_IOU_MERGE or cdist <= CROSS_CLASS_CENTROID_MERGE:
+                score = -overlap if overlap >= CROSS_CLASS_IOU_MERGE else cdist
+                cross_pairs.append((score, d_idx, t_idx))
 
     cross_pairs.sort()
-    for neg_iou, d_idx, t_idx in cross_pairs:
+    for score, d_idx, t_idx in cross_pairs:
         if d_idx in used_det or t_idx in used_track_idx:
             continue
         tid, tr = track_items[t_idx]
@@ -196,11 +219,23 @@ def update_tracks(
         used_track_idx.add(t_idx)
         current_ids.add(tid)
 
-    # Unmatched detections -> new tracks
+    # Unmatched detections -> new tracks (suppress if overlapping an already-matched track)
+    matched_track_bboxes = [
+        track_items[t_idx][1].bbox for t_idx in used_track_idx
+    ]
     for d_idx, (label, bbox) in enumerate(detections):
         if d_idx in used_det:
             continue
         c = centroid_from_bbox(bbox)
+        # Suppress if this detection overlaps heavily or is very close to a
+        # track that was already matched — prevents spawning a duplicate.
+        if any(
+            iou(bbox, mb) >= CROSS_CLASS_IOU_MERGE
+            or euclid(c, centroid_from_bbox(mb)) <= CROSS_CLASS_CENTROID_MERGE
+            for mb in matched_track_bboxes
+        ):
+            used_det.add(d_idx)
+            continue
         tr = Track(next_id, label, bbox, c, now, now)
         tr.history.append(c)
         tracks[next_id] = tr
@@ -213,7 +248,8 @@ def update_tracks(
         if t_idx in used_track_idx:
             continue
         tr.lost_frames += 1
-        if tr.lost_frames > TRACK_MAX_LOST:
+        max_lost = TRACK_MAX_LOST * ABANDONED_TRACK_MAX_LOST_MULT if tr.is_abandoned else TRACK_MAX_LOST
+        if tr.lost_frames > max_lost:
             to_remove.append(tid)
 
     for tid in to_remove:
@@ -271,7 +307,7 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     print(f"[INFO] Using device: {device}")
 
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolo11n.pt")
     model.to(device)
 
     # StrongSORT tracker for persons — uses appearance re-ID so the same person
@@ -314,6 +350,7 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
 
     bag_tracks: dict[int, Track] = {}
     next_bag_id = 0
+    abandoned_ghosts: dict[int, AbandonedGhost] = {}  # graveyard for deleted abandoned tracks
 
     frame_idx = 0
     prev_gray: np.ndarray | None = None
@@ -344,6 +381,7 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
                     scene_cut = True
                     person_tracks.clear()
                     bag_tracks.clear()
+                    abandoned_ghosts.clear()
                     person_tracker.reset()
                     person_id_map.clear()
                     next_display_pid = 1
@@ -364,6 +402,9 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
             person_dets_raw: list[tuple[int, int, int, int, float]] = []  # x1,y1,x2,y2,conf
             bag_dets_raw: list[tuple[str, tuple[int, int, int, int], float]] = []
 
+            # Pre-compute tracked bag centroids for adaptive confidence threshold
+            tracked_bag_centroids = {bid: tr.centroid for bid, tr in bag_tracks.items()}
+
             for box in results.boxes:
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
@@ -373,8 +414,16 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
 
                 if label == PERSON_CLASS and conf >= PERSON_CONF:
                     person_dets_raw.append((x1, y1, x2, y2, conf))
-                elif label in BAG_CLASSES and conf >= BAG_CONF:
-                    bag_dets_raw.append((label, bbox, conf))
+                elif label in BAG_CLASSES:
+                    # Lower threshold for bags near existing tracks (prevents false drops)
+                    c = centroid_from_bbox(bbox)
+                    is_near_tracked = any(
+                        euclid(c, tc) <= MATCH_MAX_DIST
+                        for tc in tracked_bag_centroids.values()
+                    )
+                    threshold = BAG_CONF_TRACKED if is_near_tracked else BAG_CONF_NEW
+                    if conf >= threshold:
+                        bag_dets_raw.append((label, bbox, conf))
 
             # --- Person tracking via StrongSORT (appearance re-ID) ---
             # Feed detections as Nx6 array: [x1,y1,x2,y2,conf,cls=0]
@@ -428,12 +477,72 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
             for pid in to_remove_p:
                 person_tracks.pop(pid, None)
 
+            # Ghost injection: re-insert last known bbox for stable bags so
+            # update_tracks can match them even when YOLO misses a frame.
+            # This now also covers UNATTENDED bags (owner known, not yet abandoned).
+            yolo_bag_centroids = [centroid_from_bbox(b) for _, b, *_ in bag_dets_raw]
+            for bid, bag in bag_tracks.items():
+                if not bag_is_stable(bag):
+                    continue
+                should_inject = bag.is_abandoned or (bag.owner_id is not None)
+                if not should_inject:
+                    continue
+                # Only inject if YOLO didn't already detect something nearby
+                already_detected = any(
+                    euclid(bag.centroid, yc) <= MATCH_MAX_DIST for yc in yolo_bag_centroids
+                )
+                if not already_detected:
+                    bag_dets_raw.append((bag.label, bag.bbox, BAG_CONF_TRACKED))
+
             # Suppress overlapping boxes from different bag classes on the same object
             bag_dets = cross_class_nms(bag_dets_raw)
+
+            # Snapshot existing track IDs before update to detect deletions
+            pre_update_ids = set(bag_tracks.keys())
+            pre_update_abandoned = {
+                bid: bag_tracks[bid]
+                for bid in pre_update_ids
+                if bag_tracks[bid].is_abandoned
+            }
 
             bag_tracks, next_bag_id, current_bag_ids = update_tracks(
                 bag_tracks, bag_dets, now, next_bag_id
             )
+
+            # Graveyard: save deleted abandoned tracks so new tracks can inherit their state
+            deleted_ids = pre_update_ids - set(bag_tracks.keys())
+            for bid in deleted_ids:
+                if bid in pre_update_abandoned:
+                    ghost_tr = pre_update_abandoned[bid]
+                    abandoned_ghosts[bid] = AbandonedGhost(
+                        last_bbox=ghost_tr.bbox,
+                        last_centroid=ghost_tr.centroid,
+                        first_seen=ghost_tr.first_seen,
+                        last_near_owner_time=ghost_tr.last_near_owner_time,
+                        owner_id=ghost_tr.owner_id,
+                        deleted_at=now,
+                    )
+
+            # Expire stale ghosts
+            for gid in [gid for gid, g in abandoned_ghosts.items() if now - g.deleted_at > GHOST_TTL]:
+                del abandoned_ghosts[gid]
+
+            # Re-ID: if a newly created track is close to a ghost, inherit abandoned state
+            for bid in current_bag_ids:
+                if bid not in bag_tracks:
+                    continue
+                bag = bag_tracks[bid]
+                if bag.first_seen != now:  # not a newly created track
+                    continue
+                for gid, ghost in list(abandoned_ghosts.items()):
+                    if euclid(bag.centroid, ghost.last_centroid) <= GHOST_MATCH_DIST:
+                        bag.is_abandoned = True
+                        bag.first_seen = ghost.first_seen
+                        bag.last_near_owner_time = ghost.last_near_owner_time
+                        bag.owner_id = ghost.owner_id
+                        del abandoned_ghosts[gid]
+                        print(f"[INFO] Re-ID: new track B{bid} inherited abandoned state from ghost {gid}")
+                        break
 
             # Post-merge: collapse any remaining duplicate bag tracks
             current_bag_ids = merge_overlapping_bag_tracks(
@@ -441,13 +550,6 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
             )
 
             visible_people = {pid for pid in current_person_ids if pid in person_tracks}
-
-            # Draw person tracks
-            for pid in visible_people:
-                p = person_tracks[pid]
-                x1, y1, x2, y2 = p.bbox
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-                cv2.putText(frame, f"P{pid}", (x1, max(y1 - 8, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
 
             abandoned_count = 0
 
@@ -468,11 +570,17 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
                         nearest_dist = d
                         nearest_pid = pid
 
-                # True only when the ACTUAL owner (or first-seen person) is nearby
+                # True only when the ACTUAL owner (or first-seen person) is nearby.
+                # An already-abandoned bag must not be claimable by a passing stranger.
                 owner_is_near = (
                     nearest_pid is not None
                     and nearest_dist <= ATTACH_DIST
-                    and (bag.owner_id is None or nearest_pid == bag.owner_id)
+                    and (
+                        # Known owner returning
+                        (bag.owner_id is not None and nearest_pid == bag.owner_id)
+                        # Unclaimed bag not yet abandoned — first nearby person becomes owner
+                        or (bag.owner_id is None and not bag.is_abandoned)
+                    )
                 )
 
                 if owner_is_near:
@@ -503,9 +611,15 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
                         status = f"UNATTENDED {away_for:.1f}s"
                         color = (0, 165, 255)
                     elif bag.owner_id is None:
-                        # Bag appeared without a detected owner — treat as unowned
-                        status = "UNOWNED"
-                        color = (128, 128, 128)
+                        away_for_unowned = now - bag.first_seen
+                        if bag_is_stable(bag) and away_for_unowned >= UNOWNED_ABANDON_SECONDS:
+                            bag.is_abandoned = True
+                            status = f"ABANDONED {away_for_unowned:.1f}s"
+                            color = (0, 0, 255)
+                            abandoned_count += 1
+                        else:
+                            status = f"UNOWNED {away_for_unowned:.1f}s"
+                            color = (128, 128, 128)
                     else:
                         status = f"UNATTENDED {away_for:.1f}s"
                         color = (0, 165, 255)
@@ -521,7 +635,7 @@ def detect_abandoned(video_path: str, output_path: str = "video_output/output.mp
                     2,
                 )
 
-            hud = f"Frame: {frame_idx}  Persons: {len(visible_people)}  Bags: {len(current_bag_ids)}  Abandoned: {abandoned_count}"
+            hud = f"Frame: {frame_idx}  Bags: {len(current_bag_ids)}  Abandoned: {abandoned_count}"
             cv2.putText(frame, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             out.write(frame)

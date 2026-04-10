@@ -224,3 +224,5 @@ skills-lock.json
 *.pt
 
 .DS_Store
+
+captures/*
